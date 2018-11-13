@@ -13,6 +13,7 @@ import (
 	"math/big"
 	mr "math/rand"
 	"net/http"
+	"strings"
 	"time"
 )
 
@@ -23,9 +24,9 @@ type validityDate struct {
 }
 
 type certRequest struct {
-	CommonName   string       `json:"cn"`
-	DNSNames     []string     `json:"dns_names"`
-	ValidityDate validityDate `json:"validity"`
+	CommonName string       `json:"cn"`
+	DNSNames   []string     `json:"dns_names"`
+	NotAfter   validityDate `json:"not_after"`
 }
 
 type certResponse struct {
@@ -65,21 +66,12 @@ func generateCert(w http.ResponseWriter, r *http.Request) {
 		log.Printf("Parse error: %s\n", err)
 	}
 
-	// Default to 1 Year if validity is not passed
-	vyears := request.ValidityDate.Years
-	vmonths := request.ValidityDate.Months
-	vdays := request.ValidityDate.Days
-	if vyears+vmonths+vdays == 0 {
-		vyears = 1
-	}
-	notAfter := time.Now().AddDate(vyears, vmonths, vdays)
-
 	template := &x509.Certificate{
 		Subject:      pkix.Name{CommonName: request.CommonName},
 		DNSNames:     request.DNSNames,
 		SerialNumber: generateSerial(16),
-		NotBefore:    time.Now(),
-		NotAfter:     notAfter,
+		NotBefore:    computeDate(nil, 0),
+		NotAfter:     computeDate(&request.NotAfter, 1),
 	}
 
 	// generate private key
@@ -96,17 +88,27 @@ func generateCert(w http.ResponseWriter, r *http.Request) {
 		fmt.Printf("createCert err: %s\n", err)
 	}
 
+	base64Private := fmt.Sprintf("-----BEGIN PRIVATE KEY-----\n%s\n-----END PRIVATE KEY-----", chunkString(base64.StdEncoding.EncodeToString(x509.MarshalPKCS1PrivateKey(privatekey)), 64))
+
 	pubkey, _ := x509.MarshalPKIXPublicKey(publickey)
+	base64Public := fmt.Sprintf("-----BEGIN PUBLIC KEY-----\n%s\n-----END PUBLIC KEY-----", chunkString(base64.StdEncoding.EncodeToString(pubkey), 64))
+
+	base64Cert := fmt.Sprintf("-----BEGIN CERTIFICATE-----\n%s\n-----END CERTIFICATE-----", chunkString(base64.StdEncoding.EncodeToString(cert), 64))
 
 	res := certResponse{
-		PrivateKey:  base64.StdEncoding.EncodeToString(x509.MarshalPKCS1PrivateKey(privatekey)),
-		PublicKey:   base64.StdEncoding.EncodeToString(pubkey),
-		Certificate: base64.StdEncoding.EncodeToString(cert),
+		PrivateKey:  base64Private,
+		PublicKey:   base64Public,
+		Certificate: base64Cert,
 	}
 
-	j, _ := json.Marshal(res)
-	w.Header().Set("Content-Type", "application/json")
-	w.Write(j)
+	if strings.Contains(r.Header.Get("Accept"), "application/json") {
+		j, _ := json.Marshal(res)
+		w.Header().Set("Content-Type", "application/json")
+		w.Write(j)
+	} else {
+		w.Header().Set("Content-Type", "text/plain")
+		w.Write([]byte(fmt.Sprintf("%s\n%s\n%s", base64Public, base64Private, base64Cert)))
+	}
 }
 
 func generateSerial(l int) *big.Int {
@@ -119,4 +121,38 @@ func generateSerial(l int) *big.Int {
 	z := new(big.Int)
 	z.SetBytes(buf)
 	return z
+}
+
+func computeDate(vd *validityDate, defaultYears int) time.Time {
+	if vd == nil {
+		return time.Now()
+	}
+
+	vyears := vd.Years
+	vmonths := vd.Months
+	vdays := vd.Days
+	if vyears+vmonths+vdays == 0 {
+		vyears = defaultYears
+	}
+
+	return time.Now().AddDate(vyears, vmonths, vdays)
+}
+
+func chunkString(s string, chunkSize int) string {
+	var chunks []string
+	runes := []rune(s)
+
+	if len(runes) == 0 {
+		return s
+	}
+
+	for i := 0; i < len(runes); i += chunkSize {
+		nn := i + chunkSize
+		if nn > len(runes) {
+			nn = len(runes)
+		}
+		chunks = append(chunks, string(runes[i:nn]))
+	}
+
+	return strings.Join(chunks, "\n")
 }
